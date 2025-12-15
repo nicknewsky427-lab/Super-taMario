@@ -1,203 +1,397 @@
-import json
+import asyncio
 import logging
 import os
-import re
 from datetime import datetime
-from pathlib import Path
+from typing import Iterable
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from sqlalchemy import DateTime, Float, ForeignKey, String, Text, select
+from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path("data")
-METADATA_FILE = "pet.json"
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# --------------------
+# Database setup
+# --------------------
 
 
-def slugify(text: str) -> str:
-    """Convert a pet name to a file-system-friendly slug."""
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-") or "pet"
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
 
 
-def ensure_data_dir() -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+class Pet(Base):
+    __tablename__ = "pets"
 
-
-def pet_path(name: str) -> Path:
-    ensure_data_dir()
-    return DATA_DIR / slugify(name)
-
-
-def load_pet(name: str) -> dict | None:
-    folder = pet_path(name)
-    metadata_file = folder / METADATA_FILE
-    if not metadata_file.exists():
-        return None
-    with metadata_file.open("r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def save_pet(pet: dict) -> None:
-    folder = pet_path(pet["name"])
-    folder.mkdir(parents=True, exist_ok=True)
-    with (folder / METADATA_FILE).open("w", encoding="utf-8") as file:
-        json.dump(pet, file, ensure_ascii=False, indent=2)
-
-
-def ensure_pet(name: str) -> dict:
-    pet = load_pet(name)
-    if pet is None:
-        pet = {
-            "name": name.strip(),
-            "created_at": datetime.utcnow().strftime(DATE_FORMAT),
-            "weights": [],
-            "treatments": [],
-            "vaccines": [],
-            "events": [],
-        }
-        save_pet(pet)
-    return pet
-
-
-def record_entry(pet: dict, key: str, value: str) -> None:
-    pet[key].append({
-        "value": value,
-        "timestamp": datetime.utcnow().strftime(DATE_FORMAT),
-    })
-    save_pet(pet)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = (
-        "Привет! Я бот дневника питомцев.\n"
-        "Добавь питомца: /addpet Имя\n"
-        "Вес: /weight Имя 5.3\n"
-        "Обработка: /care Имя обработка\n"
-        "Вакцина: /vaccine Имя вакцина\n"
-        "Событие: /event Имя событие\n"
-        "Список питомцев: /listpets\n"
-        "Информация: /petinfo Имя"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=datetime.utcnow, nullable=False
     )
-    await update.message.reply_text(message)
+
+    weights: Mapped[list["WeightEntry"]] = relationship(
+        back_populates="pet",
+        cascade="all, delete-orphan",
+        order_by="WeightEntry.timestamp",
+    )
+    treatments: Mapped[list["TreatmentEntry"]] = relationship(
+        back_populates="pet",
+        cascade="all, delete-orphan",
+        order_by="TreatmentEntry.timestamp",
+    )
+    vaccines: Mapped[list["VaccineEntry"]] = relationship(
+        back_populates="pet",
+        cascade="all, delete-orphan",
+        order_by="VaccineEntry.timestamp",
+    )
+    events: Mapped[list["EventEntry"]] = relationship(
+        back_populates="pet",
+        cascade="all, delete-orphan",
+        order_by="EventEntry.timestamp",
+    )
 
 
-async def add_pet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Укажите имя питомца: /addpet Имя")
-        return
-    name = " ".join(context.args).strip()
-    pet = ensure_pet(name)
-    await update.message.reply_text(f"Питомец {pet['name']} добавлен. Папка: {pet_path(name)}")
+class EntryBase:
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), default=datetime.utcnow, nullable=False
+    )
 
 
-async def add_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /weight Имя 5.3")
-        return
-    name = " ".join(context.args[:-1])
-    weight = context.args[-1]
-    pet = ensure_pet(name)
-    record_entry(pet, "weights", weight)
-    await update.message.reply_text(f"Вес {weight} сохранён для {pet['name']}")
+class WeightEntry(EntryBase, Base):
+    __tablename__ = "weights"
+
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id", ondelete="CASCADE"))
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+
+    pet: Mapped[Pet] = relationship(back_populates="weights")
 
 
-async def add_care(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /care Имя описание")
-        return
-    name = context.args[0]
-    note = " ".join(context.args[1:])
-    pet = ensure_pet(name)
-    record_entry(pet, "treatments", note)
-    await update.message.reply_text(f"Обработка сохранена для {pet['name']}")
+class TreatmentEntry(EntryBase, Base):
+    __tablename__ = "treatments"
+
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id", ondelete="CASCADE"))
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    pet: Mapped[Pet] = relationship(back_populates="treatments")
 
 
-async def add_vaccine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /vaccine Имя вакцина")
-        return
-    name = context.args[0]
-    note = " ".join(context.args[1:])
-    pet = ensure_pet(name)
-    record_entry(pet, "vaccines", note)
-    await update.message.reply_text(f"Вакцинация сохранена для {pet['name']}")
+class VaccineEntry(EntryBase, Base):
+    __tablename__ = "vaccines"
+
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id", ondelete="CASCADE"))
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    pet: Mapped[Pet] = relationship(back_populates="vaccines")
 
 
-async def add_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /event Имя событие")
-        return
-    name = context.args[0]
-    note = " ".join(context.args[1:])
-    pet = ensure_pet(name)
-    record_entry(pet, "events", note)
-    await update.message.reply_text(f"Событие сохранено для {pet['name']}")
+class EventEntry(EntryBase, Base):
+    __tablename__ = "events"
+
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id", ondelete="CASCADE"))
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    pet: Mapped[Pet] = relationship(back_populates="events")
 
 
-async def list_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ensure_data_dir()
-    pets: list[str] = []
-    for folder in sorted(DATA_DIR.iterdir()):
-        if not folder.is_dir():
-            continue
-        metadata_file = folder / METADATA_FILE
-        if metadata_file.exists():
-            with metadata_file.open("r", encoding="utf-8") as file:
-                data = json.load(file)
-                pets.append(data.get("name", folder.name))
-        else:
-            pets.append(folder.name)
-
-    if not pets:
-        await update.message.reply_text("Питомцы ещё не добавлены")
-        return
-
-    await update.message.reply_text("Питомцы:\n" + "\n".join(pets))
+def _make_async_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgresql://") and "+asyncpg" not in url:
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
 
 
-def format_entries(entries: list[dict], title: str) -> str:
-    if not entries:
+database_url = os.environ.get("DATABASE_URL")
+if not database_url:
+    raise RuntimeError("DATABASE_URL не задан. Установите переменную окружения.")
+
+
+engine = create_async_engine(_make_async_url(database_url), echo=False, future=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# --------------------
+# Telegram UI helpers
+# --------------------
+
+
+MAIN_MENU = "MAIN_MENU"
+ADD_PET = "ADD_PET"
+LIST_PETS = "LIST_PETS"
+PET_INFO = "PET_INFO"
+ADD_WEIGHT = "ADD_WEIGHT"
+ADD_CARE = "ADD_CARE"
+ADD_VACCINE = "ADD_VACCINE"
+ADD_EVENT = "ADD_EVENT"
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Добавить питомца", callback_data=ADD_PET)],
+            [InlineKeyboardButton("Список питомцев", callback_data=LIST_PETS)],
+            [InlineKeyboardButton("Информация о питомце", callback_data=PET_INFO)],
+            [InlineKeyboardButton("Добавить вес", callback_data=ADD_WEIGHT)],
+            [InlineKeyboardButton("Добавить обработку", callback_data=ADD_CARE)],
+            [InlineKeyboardButton("Добавить вакцинацию", callback_data=ADD_VACCINE)],
+            [InlineKeyboardButton("Добавить событие", callback_data=ADD_EVENT)],
+        ]
+    )
+
+
+def format_entries(entries: Iterable[EntryBase], title: str, formatter=str) -> str:
+    entries_list = list(entries)
+    if not entries_list:
         return f"{title}: пока пусто"
-    lines = [f"{entry['timestamp']}: {entry['value']}" for entry in entries]
+
+    lines = [
+        f"{entry.timestamp.strftime('%Y-%m-%d %H:%M:%S')}: {formatter(entry)}"
+        for entry in entries_list
+    ]
     return f"{title}:\n" + "\n".join(lines)
 
 
-async def pet_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Укажите имя: /petinfo Имя")
+async def fetch_pets(session: AsyncSession) -> list[Pet]:
+    result = await session.execute(select(Pet).order_by(Pet.name))
+    return list(result.scalars().all())
+
+
+async def ensure_pet(session: AsyncSession, name: str) -> Pet:
+    query = await session.execute(select(Pet).where(Pet.name == name))
+    pet = query.scalar_one_or_none()
+    if pet:
+        return pet
+
+    pet = Pet(name=name.strip())
+    session.add(pet)
+    await session.commit()
+    await session.refresh(pet)
+    return pet
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Привет! Я бот дневника питомцев. Выберите действие:",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def show_main_menu(update: Update, text: str) -> None:
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+async def prompt_for_pet_name(update: Update) -> None:
+    await update.callback_query.edit_message_text(
+        "Введите имя питомца и отправьте сообщением."
+    )
+
+
+async def send_pet_selection(
+    update: Update, action: str, session: AsyncSession, empty_message: str
+) -> None:
+    pets = await fetch_pets(session)
+    if not pets:
+        await update.callback_query.edit_message_text(empty_message, reply_markup=main_menu_keyboard())
         return
-    name = " ".join(context.args)
-    pet = load_pet(name)
-    if pet is None:
-        await update.message.reply_text("Питомец не найден. Сначала добавьте его через /addpet")
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for pet in pets:
+        buttons.append(
+            [InlineKeyboardButton(pet.name, callback_data=f"SELECT|{action}|{pet.id}")]
+        )
+    buttons.append([InlineKeyboardButton("Назад", callback_data=MAIN_MENU)])
+    await update.callback_query.edit_message_text(
+        "Выберите питомца:", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    async with SessionLocal() as session:
+        if data == MAIN_MENU:
+            context.user_data.clear()
+            await show_main_menu(update, "Выберите действие:")
+        elif data == ADD_PET:
+            context.user_data.clear()
+            context.user_data["state"] = "ADD_PET_NAME"
+            await prompt_for_pet_name(update)
+        elif data == LIST_PETS:
+            pets = await fetch_pets(session)
+            if not pets:
+                text = "Питомцы ещё не добавлены"
+            else:
+                text = "Питомцы:\n" + "\n".join(pet.name for pet in pets)
+            await query.edit_message_text(text, reply_markup=main_menu_keyboard())
+        elif data == PET_INFO:
+            context.user_data.clear()
+            await send_pet_selection(
+                update, "INFO", session, "Питомцы ещё не добавлены"
+            )
+        elif data in {ADD_WEIGHT, ADD_CARE, ADD_VACCINE, ADD_EVENT}:
+            context.user_data.clear()
+            await send_pet_selection(update, data, session, "Сначала добавьте питомца")
+        elif data.startswith("SELECT|"):
+            try:
+                _, action, pet_id_str = data.split("|", 2)
+                pet_id = int(pet_id_str)
+            except ValueError:
+                await query.edit_message_text("Некорректные данные", reply_markup=main_menu_keyboard())
+                return
+
+            context.user_data["pet_id"] = pet_id
+            context.user_data["state"] = action
+
+            prompts = {
+                "INFO": "Загружаю информацию...",
+                ADD_WEIGHT: "Введите вес питомца в килограммах (например, 5.3)",
+                ADD_CARE: "Опишите обработку (препарат, дозировка, причина)",
+                ADD_VACCINE: "Укажите вакцинацию (название препарата, дата)",
+                ADD_EVENT: "Опишите событие"
+            }
+
+            if action == "INFO":
+                pet = await session.get(Pet, pet_id)
+                if not pet:
+                    await query.edit_message_text(
+                        "Питомец не найден", reply_markup=main_menu_keyboard()
+                    )
+                    context.user_data.clear()
+                    return
+
+                await session.refresh(pet, attribute_names=["weights", "treatments", "vaccines", "events"])
+
+                lines = [
+                    f"Питомец: {pet.name}",
+                    format_entries(pet.weights, "Вес", lambda e: f"{e.value} кг"),
+                    format_entries(pet.treatments, "Обработки", lambda e: e.description),
+                    format_entries(pet.vaccines, "Вакцины", lambda e: e.description),
+                    format_entries(pet.events, "События", lambda e: e.description),
+                ]
+                await query.edit_message_text(
+                    "\n\n".join(lines), reply_markup=main_menu_keyboard()
+                )
+                context.user_data.clear()
+                return
+
+            await query.edit_message_text(prompts.get(action, "Введите данные"))
+        else:
+            await query.edit_message_text("Неизвестная команда", reply_markup=main_menu_keyboard())
+
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = context.user_data.get("state")
+    if not state:
+        await update.message.reply_text(
+            "Выберите действие из меню.", reply_markup=main_menu_keyboard()
+        )
         return
-    parts = [
-        f"Питомец: {pet['name']}",
-        format_entries(pet.get("weights", []), "Вес"),
-        format_entries(pet.get("treatments", []), "Обработки"),
-        format_entries(pet.get("vaccines", []), "Вакцины"),
-        format_entries(pet.get("events", []), "События"),
-    ]
-    await update.message.reply_text("\n\n".join(parts))
+
+    text = update.message.text.strip()
+    async with SessionLocal() as session:
+        if state == "ADD_PET_NAME":
+            if not text:
+                await update.message.reply_text("Имя не может быть пустым")
+                return
+            pet = await ensure_pet(session, text)
+            await update.message.reply_text(
+                f"Питомец {pet.name} добавлен.", reply_markup=main_menu_keyboard()
+            )
+            context.user_data.clear()
+            return
+
+        pet_id = context.user_data.get("pet_id")
+        if not pet_id:
+            await update.message.reply_text(
+                "Сначала выберите питомца через меню.", reply_markup=main_menu_keyboard()
+            )
+            context.user_data.clear()
+            return
+
+        pet = await session.get(Pet, pet_id)
+        if not pet:
+            await update.message.reply_text(
+                "Питомец не найден", reply_markup=main_menu_keyboard()
+            )
+            context.user_data.clear()
+            return
+
+        if state == ADD_WEIGHT:
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text(
+                    "Не удалось прочитать вес. Введите число, например 5.3"
+                )
+                return
+
+            entry = WeightEntry(pet_id=pet.id, value=value)
+            session.add(entry)
+            await session.commit()
+            await update.message.reply_text(
+                f"Вес {value} кг сохранён для {pet.name}",
+                reply_markup=main_menu_keyboard(),
+            )
+        elif state == ADD_CARE:
+            entry = TreatmentEntry(pet_id=pet.id, description=text)
+            session.add(entry)
+            await session.commit()
+            await update.message.reply_text(
+                f"Обработка сохранена для {pet.name}", reply_markup=main_menu_keyboard()
+            )
+        elif state == ADD_VACCINE:
+            entry = VaccineEntry(pet_id=pet.id, description=text)
+            session.add(entry)
+            await session.commit()
+            await update.message.reply_text(
+                f"Вакцинация сохранена для {pet.name}", reply_markup=main_menu_keyboard()
+            )
+        elif state == ADD_EVENT:
+            entry = EventEntry(pet_id=pet.id, description=text)
+            session.add(entry)
+            await session.commit()
+            await update.message.reply_text(
+                f"Событие сохранено для {pet.name}", reply_markup=main_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "Неизвестная операция", reply_markup=main_menu_keyboard()
+            )
+
+    context.user_data.clear()
 
 
 def build_application(token: str) -> Application:
     application = Application.builder().token(token).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("addpet", add_pet))
-    application.add_handler(CommandHandler("weight", add_weight))
-    application.add_handler(CommandHandler("care", add_care))
-    application.add_handler(CommandHandler("vaccine", add_vaccine))
-    application.add_handler(CommandHandler("event", add_event))
-    application.add_handler(CommandHandler("listpets", list_pets))
-    application.add_handler(CommandHandler("petinfo", pet_info))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_user_message)
+    )
 
     return application
 
@@ -206,6 +400,8 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN не задан. Установите переменную окружения.")
+
+    asyncio.run(init_db())
 
     application = build_application(token)
     logger.info("Запуск бота...")
