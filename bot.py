@@ -3,6 +3,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import DateTime, Float, ForeignKey, String, Text, select
 from sqlalchemy.engine.url import make_url
@@ -106,8 +107,18 @@ class EventEntry(EntryBase, Base):
     pet: Mapped[Pet] = relationship(back_populates="events")
 
 
+def sanitize_db_url(url: str) -> str:
+    """Remove query parameters incompatible with the async driver."""
+
+    parsed_url = urlparse(url)
+    query = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
+    query.pop("channel_binding", None)
+    new_query = urlencode(query)
+    return urlunparse(parsed_url._replace(query=new_query))
+
+
 def _make_async_url(url: str) -> tuple[str, dict]:
-    url_obj = make_url(url)
+    url_obj = make_url(sanitize_db_url(url))
     sslmode = url_obj.query.get("sslmode")
 
     query = dict(url_obj.query)
