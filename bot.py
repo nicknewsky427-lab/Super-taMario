@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Iterable
 
 from sqlalchemy import DateTime, Float, ForeignKey, String, Text, select
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -105,12 +106,24 @@ class EventEntry(EntryBase, Base):
     pet: Mapped[Pet] = relationship(back_populates="events")
 
 
-def _make_async_url(url: str) -> str:
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    if url.startswith("postgresql://") and "+asyncpg" not in url:
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+def _make_async_url(url: str) -> tuple[str, dict]:
+    url_obj = make_url(url)
+    sslmode = url_obj.query.get("sslmode")
+
+    query = dict(url_obj.query)
+    query.pop("sslmode", None)
+
+    ssl_required = bool(sslmode and sslmode.lower() != "disable")
+
+    async_url = str(
+        url_obj.set(drivername="postgresql+asyncpg", query=query)
+        if url_obj.drivername.startswith("postgres")
+        else url_obj
+    )
+
+    connect_args = {"ssl": ssl_required} if ssl_required else {}
+
+    return async_url, connect_args
 
 
 database_url = os.environ.get("DATABASE_URL")
@@ -118,7 +131,11 @@ if not database_url:
     raise RuntimeError("DATABASE_URL не задан. Установите переменную окружения.")
 
 
-engine = create_async_engine(_make_async_url(database_url), echo=False, future=True)
+async_url, connect_args = _make_async_url(database_url)
+
+engine = create_async_engine(
+    async_url, echo=False, future=True, connect_args=connect_args
+)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
