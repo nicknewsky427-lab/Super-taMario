@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -203,23 +202,19 @@ def build_application(token: str) -> Application:
     return application
 
 
-async def main() -> None:
+def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN не задан. Установите переменную окружения.")
 
     application = build_application(token)
     logger.info("Запуск бота...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    await application.updater.wait_until_closed()
-    await application.stop()
-    await application.shutdown()
+
+    application.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен")
